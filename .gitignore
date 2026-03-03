@@ -1,0 +1,14 @@
+# Capture files
+captures/
+logs/
+reports/
+
+# Aircrack outputs
+*.cap
+*.csv
+*.netxml
+*.log
+
+# System files
+*.swp
+.DS_Store
