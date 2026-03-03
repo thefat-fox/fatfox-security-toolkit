@@ -1,58 +1,232 @@
 #!/bin/bash
 
-# FatFox WiFi Audit Helper
-# Authorized testing only
+# ===== VERSION =====
+VERSION="1.3"
 
-WORDLIST="/usr/share/wordlists/rockyou.txt"
+# ===== COLORS =====
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+CYAN="\e[36m"
+RESET="\e[0m"
 
-function banner() {
-    echo "======================================"
-    echo "        FATFOX WIFI AUDITOR"
-    echo "   Authorized Security Testing Only"
-    echo "======================================"
-}
+# ===== CONFIG =====
+BASE_DIR="$HOME/fatfox-wifi"
+CAPTURE_DIR="$BASE_DIR/captures"
+REPORT_DIR="$BASE_DIR/reports"
+LOG_DIR="$BASE_DIR/logs"
+LOG_FILE="$LOG_DIR/session.log"
 
-function check_requirements() {
-    if ! command -v aircrack-ng &> /dev/null; then
-        echo "[!] aircrack-ng not installed."
+mkdir -p "$CAPTURE_DIR" "$REPORT_DIR" "$LOG_DIR"
+
+clear
+echo -e "${CYAN}======================================"
+echo -e "     FATFOX SECURITY TOOLKIT v$VERSION"
+echo -e "     Authorized WiFi Audit Only"
+echo -e "======================================${RESET}"
+echo ""
+
+# ===== DEPENDENCY CHECK =====
+for tool in airodump-ng aircrack-ng iw; do
+    if ! command -v $tool &>/dev/null; then
+        echo -e "${RED}[!] Required tool missing: $tool${RESET}"
         exit 1
     fi
+done
 
-    if [ ! -f "$WORDLIST" ]; then
-        echo "[!] rockyou.txt not found at $WORDLIST"
-        echo "    Try: sudo gunzip /usr/share/wordlists/rockyou.txt.gz"
-        exit 1
+echo -e "${GREEN}[+] Dependencies verified.${RESET}"
+
+# ===== AUTHORIZATION CHECK =====
+read -p "Confirm written authorization? (yes/no): " confirm
+if [[ "$confirm" != "y" ]]; then
+    echo -e "${RED}[!] Authorization required. Exiting.${RESET}"
+    exit 1
+fi
+
+echo -e "${GREEN}[+] Authorization confirmed.${RESET}"
+echo "$(date) - Authorization confirmed" >> "$LOG_FILE"
+echo ""
+
+# ===== MONITOR INTERFACE DETECTION =====
+echo -e "${CYAN}[*] Detecting monitor mode interfaces...${RESET}"
+
+MON_INTERFACES=()
+
+while read -r line; do
+    iface=$(echo "$line" | awk '{print $1}')
+    MON_INTERFACES+=("$iface")
+done < <(iw dev | awk '/Interface/ {iface=$2} /type monitor/ {print iface}')
+
+if [ ${#MON_INTERFACES[@]} -eq 0 ]; then
+    echo -e "${YELLOW}[!] No monitor interface found.${RESET}"
+    echo "Available wireless interfaces:"
+    iw dev | awk '/Interface/ {print "- " $2}'
+    read -p "Enter interface to enable monitor mode on: " baseiface
+    sudo airmon-ng start "$baseiface"
+
+    echo ""
+    echo -e "${CYAN}[*] Re-checking monitor interfaces...${RESET}"
+
+    while read -r line; do
+        iface=$(echo "$line" | awk '{print $1}')
+        MON_INTERFACES+=("$iface")
+    done < <(iw dev | awk '/Interface/ {iface=$2} /type monitor/ {print iface}')
+fi
+
+if [ ${#MON_INTERFACES[@]} -eq 0 ]; then
+    echo -e "${RED}[!] Failed to create monitor interface. Exiting.${RESET}"
+    exit 1
+fi
+
+echo -e "${GREEN}[+] Monitor interfaces detected:${RESET}"
+select INTERFACE in "${MON_INTERFACES[@]}"; do
+    if [[ -n "$INTERFACE" ]]; then
+        echo -e "${GREEN}[+] Using interface: $INTERFACE${RESET}"
+        break
+    else
+        echo "Invalid selection."
     fi
-}
+done
 
-function authorization_check() {
-    echo
-    read -p "Do you confirm you have written authorization to test this network? (yes/no): " auth
-    if [ "$auth" != "yes" ]; then
-        echo "[!] Authorization required. Exiting."
-        exit 1
-    fi
-}
+echo ""
 
-function crack_handshake() {
-    echo
-    read -p "Enter path to captured handshake file (.cap): " capfile
+# ===== MAIN MENU =====
+while true; do
+    echo -e "${BLUE}--------- MAIN MENU ---------${RESET}"
+    echo "1) Pre-Scan Reminder Mode"
+    echo "2) Start New Audit Session"
+    echo "3) Verify Handshake File"
+    echo "4) Generate Audit Report Template"
+    echo "5) Clean Old Captures"
+    echo "6) Exit"
+    echo "-----------------------------"
+    read -p "Select option: " choice
 
-    if [ ! -f "$capfile" ]; then
-        echo "[!] File not found."
-        exit 1
-    fi
+    case $choice in
 
-    echo
-    read -p "Enter target BSSID (AP MAC): " bssid
+        1)
+            echo ""
+            echo -e "${CYAN}========== PRE-SCAN MODE ==========${RESET}"
+            echo "Run in another terminal:"
+            echo -e "${YELLOW}   sudo airodump-ng $INTERFACE${RESET}"
+            echo ""
+            echo "Note SSID, BSSID, Channel."
+            read -p "Press Enter once collected..."
+            ;;
 
-    echo
-    echo "[*] Starting dictionary attack with rockyou.txt..."
-    aircrack-ng -w "$WORDLIST" -b "$bssid" "$capfile"
-}
+        2)
+            echo ""
+            read -p "Enter target SSID: " SSID
+            read -p "Enter target BSSID: " BSSID
+            read -p "Enter channel: " CHANNEL
 
-# Main
-banner
-check_requirements
-authorization_check
-crack_handshake
+            echo ""
+            echo -e "${CYAN}Target Summary:${RESET}"
+            echo "SSID: $SSID"
+            echo "BSSID: $BSSID"
+            echo "Channel: $CHANNEL"
+            echo ""
+
+            read -p "Proceed with capture? (yes/no): " proceed
+            if [[ "$proceed" != "yes" ]]; then
+                echo -e "${YELLOW}[!] Session cancelled.${RESET}"
+                continue
+            fi
+
+            SESSION_NAME="${SSID}_$(date +%Y%m%d_%H%M%S)"
+
+            echo -e "${CYAN}[*] Starting session: $SESSION_NAME${RESET}"
+            echo "$(date) - Session started: $SESSION_NAME" >> "$LOG_FILE"
+
+            sudo airodump-ng -c "$CHANNEL" --bssid "$BSSID" \
+            -w "$CAPTURE_DIR/$SESSION_NAME" "$INTERFACE"
+            ;;
+
+        3)
+            echo ""
+            shopt -s nullglob
+            CAP_FILES=("$CAPTURE_DIR"/*.cap)
+
+            if [ ${#CAP_FILES[@]} -eq 0 ]; then
+                echo -e "${RED}[!] No capture files found.${RESET}"
+                continue
+            fi
+
+            echo "Available capture files:"
+            select CAP in "${CAP_FILES[@]}"; do
+                if [[ -n "$CAP" ]]; then
+                    echo -e "${YELLOW}[*] Checking handshake...${RESET}"
+                    HANDSHAKE=$(aircrack-ng "$CAP" 2>/dev/null | grep -i "handshake")
+
+                    if [[ -z "$HANDSHAKE" ]]; then
+                        echo -e "${RED}[!] No valid WPA handshake found.${RESET}"
+                    else
+                        echo -e "${GREEN}[+] Handshake detected!${RESET}"
+                        echo "$(date) - Handshake verified: $CAP" >> "$LOG_FILE"
+                    fi
+                    break
+                fi
+            done
+            ;;
+
+        4)
+            echo ""
+            read -p "Enter client name: " CLIENT
+            read -p "Enter test date (YYYY-MM-DD): " TESTDATE
+
+            REPORT_FILE="$REPORT_DIR/${CLIENT}_${TESTDATE}.txt"
+
+            cat <<EOF > "$REPORT_FILE"
+=========================================
+        FATFOX WIFI SECURITY REPORT
+=========================================
+
+Client: $CLIENT
+Test Date: $TESTDATE
+Auditor: FatFox Security Toolkit v$VERSION
+
+Scope:
+- Authorized WiFi security assessment
+
+Findings:
+- Handshake capture status:
+- Encryption type:
+- Password strength assessment:
+
+Recommendations:
+- Use strong WPA2/WPA3 passphrase
+- Disable WPS
+- Enable MAC monitoring
+- Conduct regular audits
+
+=========================================
+EOF
+
+            echo -e "${GREEN}[+] Report template generated:${RESET}"
+            echo "$REPORT_FILE"
+            ;;
+
+        5)
+            echo ""
+            read -p "Delete all old capture files? (yes/no): " CLEAN
+            if [[ "$CLEAN" == "yes" ]]; then
+                rm -f "$CAPTURE_DIR"/*.cap
+                echo -e "${GREEN}[+] Old captures removed.${RESET}"
+            else
+                echo -e "${YELLOW}[!] Cleanup cancelled.${RESET}"
+            fi
+            ;;
+
+        6)
+            echo -e "${CYAN}[+] Exiting FatFox Toolkit.${RESET}"
+            exit 0
+            ;;
+
+        *)
+            echo -e "${RED}[!] Invalid option.${RESET}"
+            ;;
+    esac
+
+    echo ""
+done
