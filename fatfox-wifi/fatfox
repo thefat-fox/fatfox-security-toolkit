@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# FatFox WiFi Audit Helper
+# Authorized testing only
+
+WORDLIST="/usr/share/wordlists/rockyou.txt"
+
+function banner() {
+    echo "======================================"
+    echo "        FATFOX WIFI AUDITOR"
+    echo "   Authorized Security Testing Only"
+    echo "======================================"
+}
+
+function check_requirements() {
+    if ! command -v aircrack-ng &> /dev/null; then
+        echo "[!] aircrack-ng not installed."
+        exit 1
+    fi
+
+    if [ ! -f "$WORDLIST" ]; then
+        echo "[!] rockyou.txt not found at $WORDLIST"
+        echo "    Try: sudo gunzip /usr/share/wordlists/rockyou.txt.gz"
+        exit 1
+    fi
+}
+
+function authorization_check() {
+    echo
+    read -p "Do you confirm you have written authorization to test this network? (yes/no): " auth
+    if [ "$auth" != "yes" ]; then
+        echo "[!] Authorization required. Exiting."
+        exit 1
+    fi
+}
+
+function crack_handshake() {
+    echo
+    read -p "Enter path to captured handshake file (.cap): " capfile
+
+    if [ ! -f "$capfile" ]; then
+        echo "[!] File not found."
+        exit 1
+    fi
+
+    echo
+    read -p "Enter target BSSID (AP MAC): " bssid
+
+    echo
+    echo "[*] Starting dictionary attack with rockyou.txt..."
+    aircrack-ng -w "$WORDLIST" -b "$bssid" "$capfile"
+}
+
+# Main
+banner
+check_requirements
+authorization_check
+crack_handshake
