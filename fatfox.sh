@@ -23,7 +23,7 @@ declare -A SESSION_DATA
 # HEADER
 clear
 echo -e "${GREEN}======================================"
-echo -e "      FATFOX SECURITY TOOLKIT v1.6.0"
+echo -e "      FATFOX SECURITY TOOLKIT v1.8.0"
 echo -e "      Authorized WiFi Audit Only"
 echo -e "======================================${NC}"
 read -p "Confirm written authorization? (yes/no): " AUTH
