@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================
-#        FATFOX SECURITY TOOLKIT v1.6.0
+#        FATFOX SECURITY TOOLKIT v1.8.0
 #      Authorized WiFi Audit Only
 # ======================================
 
