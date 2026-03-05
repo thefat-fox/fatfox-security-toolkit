@@ -305,7 +305,7 @@ while true; do
             echo -e "${GREEN}[+] Cleanup complete${NC}"
             ;;
         9)
-            echo -e "${GREEN}[+] Exiting FATFOX Toolkit v1.6.0${NC}"
+            echo -e "${GREEN}[+] Exiting FATFOX Toolkit v1.8.0${NC}"
             exit 0
             ;;
         *)
